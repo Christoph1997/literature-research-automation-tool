@@ -1,5 +1,5 @@
 def main():
-    print("Hello from 2026-litresearch!")
+    print("Start Literature Automation Tool!")
 
 
 if __name__ == "__main__":
