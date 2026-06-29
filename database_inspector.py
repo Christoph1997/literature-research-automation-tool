@@ -58,7 +58,7 @@ class JsonDatabaseInspector:
 
         schema = self.get_schema()
 
-        return [column_name for column_name, *_ in schema]
+        return schema["column_name"].tolist()
 
     def get_first_n_rows(self, n: int = 5):
         """
