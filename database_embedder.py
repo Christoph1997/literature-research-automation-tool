@@ -16,6 +16,7 @@ from pathlib import Path
 
 import duckdb
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 from usearch.index import Index
 
@@ -51,9 +52,16 @@ class DatabaseEmbedder:
         # before embedding the whole dataset.
         self.test_mode = test_mode
 
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if self.device == "cuda":
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("CUDA not available, using CPU.")
+
         self.model = SentenceTransformer(
             self.model_name,
             model_kwargs={"dtype": "auto"},
+            device=self.device,
         )
 
         output_prefix_path = Path(output_prefix)
