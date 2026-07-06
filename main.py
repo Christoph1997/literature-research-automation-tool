@@ -28,14 +28,11 @@ def main():
     # Path prefix for saving embeddings and metadata.
     output_prefix = f"output_data/{model_name.replace('/', '_')}"
     # Query string for searching similar papers in the embedded dataset.
-    query = (
-        "The evolution of the Earth-Moon system based on the dark matter field "
-        "fluid model. "
-    )
+    query = "Deepfake detection. Human AI collaboration. Explainable AI."
     # Number of top similar results to retrieve. Set to None to ignore the top_k limit.
-    top_k = 5
+    top_k = None
     # Similarity threshold for filtering results. Set to None to ignore the threshold.
-    similarity_threshold = None
+    similarity_threshold = 0.8
     # Number of rows to embed per chunk during embedding.
     chunk_size = 16
     # Number of rows to read and embed per batch during embedding.
