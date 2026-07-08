@@ -80,6 +80,13 @@ class DatabaseEmbedder:
         self.vector_index_path = output_prefix_path.with_name(
             f"{output_prefix_path.stem}_usearch.index"
         )
+        self.ids_path = output_prefix_path.with_name(
+            f"{output_prefix_path.stem}_ids.jsonl"
+        )
+        self.texts_path = output_prefix_path.with_name(
+            f"{output_prefix_path.stem}_texts.jsonl"
+        )
+        self.embeddings_memmap = None
 
     def _count_rows(self) -> int:
         """Count rows in the Parquet file."""
@@ -151,6 +158,68 @@ class DatabaseEmbedder:
 
         return np.asarray(embeddings, dtype=np.float32)
 
+    def _create_embedding_memmap(
+        self, total_rows: int, embedding_dim: int
+    ) -> np.memmap:
+        """Create a disk-backed array for storing embeddings chunk by chunk."""
+
+        self.embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        embeddings_memmap = np.lib.format.open_memmap(
+            self.embeddings_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(total_rows, embedding_dim),
+        )
+        embeddings_memmap.flush()
+        self.embeddings_memmap = embeddings_memmap
+
+        return embeddings_memmap
+
+    def _append_chunk_to_disk(
+        self,
+        offset: int,
+        ids: list[str],
+        texts: list[str],
+        embeddings: np.ndarray,
+    ) -> None:
+        """Persist a chunk of ids, texts and embeddings to disk."""
+
+        embeddings_memmap = getattr(self, "embeddings_memmap", None)
+        if embeddings_memmap is None:
+            raise RuntimeError("Embeddings memmap was not initialized.")
+
+        start = offset
+        end = offset + len(ids)
+        embeddings_memmap[start:end] = embeddings
+        embeddings_memmap.flush()
+
+        with self.ids_path.open("a", encoding="utf-8") as file:
+            for id_value in ids:
+                file.write(json.dumps(id_value) + "\n")
+
+        with self.texts_path.open("a", encoding="utf-8") as file:
+            for text in texts:
+                file.write(json.dumps(text) + "\n")
+
+    def _load_ids(self) -> list[str]:
+        """Load persisted ids from disk."""
+
+        if not self.ids_path.exists():
+            return []
+
+        with self.ids_path.open(encoding="utf-8") as file:
+            return [json.loads(line) for line in file if line.strip()]
+
+    def _load_texts(self) -> list[str]:
+        """Load persisted texts from disk."""
+
+        if not self.texts_path.exists():
+            return []
+
+        with self.texts_path.open(encoding="utf-8") as file:
+            return [json.loads(line) for line in file if line.strip()]
+
     def _save_vector_index(self, embeddings: np.ndarray) -> None:
         """
         Save embeddings into a USearch vector index.
@@ -184,19 +253,25 @@ class DatabaseEmbedder:
 
     def _save_embeddings(
         self,
-        ids: list[str],
-        texts: list[str],
-        embeddings: np.ndarray,
+        ids: list[str] | None = None,
+        texts: list[str] | None = None,
+        embeddings: np.ndarray | None = None,
     ) -> None:
-        """Save embeddings and metadata."""
+        """Persist a lightweight metadata file that points to the on-disk assets."""
 
-        np.save(self.embeddings_path, embeddings)
+        if ids is None:
+            ids = self._load_ids()
+
+        if texts is None:
+            texts = self._load_texts()
 
         metadata = {
-            "ids": ids,
-            "texts": texts,
+            "ids_path": self.ids_path.name,
+            "texts_path": self.texts_path.name,
+            "embeddings_path": self.embeddings_path.name,
             "model": self.model_name,
             "text_columns": self.text_columns,
+            "row_count": len(ids),
         }
 
         with open(self.metadata_path, "w", encoding="utf-8") as file:
@@ -206,41 +281,66 @@ class DatabaseEmbedder:
         print(f"Saved metadata to: {self.metadata_path}\n")
 
     def run(self) -> None:
-        """Run the full embedding pipeline."""
-
-        all_ids = []
-        all_texts = []
-        embedding_chunks = []
+        """
+        Run the full embedding pipeline without accumulating all embeddings in RAM.
+        """
 
         total_rows = self._count_rows()
 
         if self.test_mode:
             total_rows = min(total_rows, self.batch_size)
 
+        if total_rows <= 0:
+            print("No rows found in the Parquet dataset. Nothing to embed.")
+            return
+
         print("Reading Parquet file...")
         limit = self.batch_size if self.test_mode else self.chunk_size
+        vector_index = None
+
+        self.ids_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ids_path.write_text("", encoding="utf-8")
+        self.texts_path.write_text("", encoding="utf-8")
+
         for offset in range(0, total_rows, self.chunk_size):
             rows = self._read_rows(limit=limit, offset=offset)
-
             ids, texts = self._build_ids_and_texts(rows)
+
+            if not ids:
+                continue
 
             print(f"Embedding {len(texts)} texts with {self.model_name}...")
             embeddings = self._embed_texts(texts)
 
-            all_ids.extend(ids)
-            all_texts.extend(texts)
-            embedding_chunks.append(embeddings)
+            if self.embeddings_memmap is None:
+                self.embeddings_memmap = self._create_embedding_memmap(
+                    total_rows=total_rows,
+                    embedding_dim=embeddings.shape[1],
+                )
 
-        combined_embeddings = np.vstack(embedding_chunks)
+            self._append_chunk_to_disk(
+                offset=offset,
+                ids=ids,
+                texts=texts,
+                embeddings=embeddings,
+            )
 
-        self._save_embeddings(
-            ids=all_ids,
-            texts=all_texts,
-            embeddings=combined_embeddings,
-        )
+            if vector_index is None:
+                vector_index = Index(
+                    ndim=embeddings.shape[1],
+                    metric="cos",
+                    dtype="f32",
+                )
 
-        # Save combined embeddings into a USearch index for faster similarity search.
-        self._save_vector_index(combined_embeddings)
+            keys = np.arange(offset, offset + len(ids), dtype=np.uint64)
+            vector_index.add(keys, embeddings)
+
+        self._save_embeddings()
+
+        if vector_index is not None:
+            print("Building USearch vector index...")
+            vector_index.save(str(self.vector_index_path))
+            print(f"Saved USearch index to: {self.vector_index_path}\n")
 
     def _save_matching_results(
         self,
@@ -323,8 +423,7 @@ class DatabaseEmbedder:
         the results in a parquet and csv file with the matching parquet rows.
         """
         print(f"Start searching for similar results for query:\n {query}\n")
-        rows = self._read_rows()
-        ids, _ = self._build_ids_and_texts(rows)
+        ids = self._load_ids()
 
         query_embedding = self.model.encode(
             [query],

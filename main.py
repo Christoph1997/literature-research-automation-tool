@@ -34,7 +34,7 @@ def main():
     # Similarity threshold for filtering results. Set to None to ignore the threshold.
     similarity_threshold = 0.8
     # Number of rows to embed per chunk during embedding.
-    chunk_size = 16
+    chunk_size = 1000
     # Number of rows to read and embed per batch during embedding.
     batch_size = 8
 
